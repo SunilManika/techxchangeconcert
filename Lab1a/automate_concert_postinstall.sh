@@ -419,4 +419,3 @@ printf '============================================================\n'
 
 success "Concert authentication automation completed successfully."
 printf '\nOpen Concert in a private browser window:\n%s\n' "$CONCERT_URL"
-

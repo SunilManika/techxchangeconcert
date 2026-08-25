@@ -671,4 +671,3 @@ echo "  - Change the initial Concert admin password if it is temporary."
 echo "  - Replace the Keycloak bootstrap administrator with a permanent admin."
 echo "  - Do not expose IBM entitlement keys or Keycloak client secrets."
 echo "================================================================"
-
