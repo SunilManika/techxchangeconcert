@@ -113,17 +113,13 @@ CONCERT_HUB_NS    = os.environ.get("CONCERT_HUB_NS",    "concert-hub")
 CONCERT_REALM     = os.environ.get("CONCERT_REALM",     "concert-realm")
 CONCERT_SKIP_TLS  = os.environ.get("CONCERT_SKIP_TLS",  "false").lower() == "true"
 LOCAL_PORT        = int(os.environ.get("CONCERT_LOCAL_PORT", "18099"))
+KC_LOCAL_PORT     = int(os.environ.get("CONCERT_KC_LOCAL_PORT", "18443"))
 
 CSV_FILE = sys.argv[1] if len(sys.argv) > 1 else "instana-connections.csv"
 
 # Concert API base: strip app path suffix (e.g. /concert) — API paths root at host
 _parsed       = urllib.parse.urlparse(CONCERT_URL)
 CONCERT_BASE  = f"{_parsed.scheme}://{_parsed.netloc}"
-
-# Keycloak endpoint (on Hub route)
-KC_URL           = f"{CONCERT_HUB_URL}/sys/internal/kc"
-TOKEN_EP_MASTER  = f"{KC_URL}/realms/master/protocol/openid-connect/token"
-TOKEN_EP_REALM   = f"{KC_URL}/realms/{CONCERT_REALM}/protocol/openid-connect/token"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -338,72 +334,101 @@ if not KC_ADMIN_USER or not KC_ADMIN_PASS:
 success(f"KC bootstrap admin: {KC_ADMIN_USER}")
 
 # ---------------------------------------------------------------------------
-# Step 3 — Get Keycloak admin token (master realm / admin-cli)
+# Steps 3–5 — Keycloak admin token + concert-client secret + user validation
+#
+# The Keycloak master realm /token and /admin endpoints are NOT exposed on
+# the external Hub route.  We must port-forward to ibm-solis-hub-gw-svc
+# (same approach as add-concert-users.sh) and use the internal path:
+#   https://127.0.0.1:<KC_LOCAL_PORT>/sys/internal/kc
 # ---------------------------------------------------------------------------
 
-print("Step 3: Obtaining Keycloak admin token ...")
+print(f"Step 3: Port-forwarding to ibm-solis-hub-gw-svc:{KC_LOCAL_PORT} for Keycloak admin ...")
 
-status, body = http_post_form(TOKEN_EP_MASTER, {
-    "grant_type": "password",
-    "client_id":  "admin-cli",
-    "username":   KC_ADMIN_USER,
-    "password":   KC_ADMIN_PASS,
-})
+kc_pf_proc = subprocess.Popen(
+    ["oc", "port-forward", "-n", CONCERT_HUB_NS,
+     "svc/ibm-solis-hub-gw-svc", f"{KC_LOCAL_PORT}:11443"],
+    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+)
 
-KC_ADMIN_TOKEN = body.get("access_token", "")
-if not KC_ADMIN_TOKEN:
-    die(f"Failed to obtain KC admin token (HTTP {status}): "
-        f"{body.get('error_description', body.get('error', ''))}")
+try:
+    if not wait_for_port(KC_LOCAL_PORT, timeout=15):
+        kc_pf_proc.terminate()
+        die(f"Port-forward to localhost:{KC_LOCAL_PORT} did not become ready in 15 s.")
 
-success(f"KC admin token obtained (HTTP {status}).")
+    success(f"Keycloak port-forward ready on localhost:{KC_LOCAL_PORT}.")
 
-# ---------------------------------------------------------------------------
-# Step 4 — Retrieve concert-client secret from Keycloak admin API
-# ---------------------------------------------------------------------------
+    # All Keycloak admin calls go through the port-forward
+    KC_LOCAL_URL      = f"https://localhost:{KC_LOCAL_PORT}/sys/internal/kc"
+    TOKEN_EP_MASTER   = f"{KC_LOCAL_URL}/realms/master/protocol/openid-connect/token"
+    TOKEN_EP_REALM    = f"{KC_LOCAL_URL}/realms/{CONCERT_REALM}/protocol/openid-connect/token"
 
-print("Step 4: Retrieving concert-client secret ...")
+    # Step 3 cont. — admin token
+    print("  Obtaining Keycloak admin token (master realm / admin-cli) ...")
+    status, body = http_post_form(TOKEN_EP_MASTER, {
+        "grant_type": "password",
+        "client_id":  "admin-cli",
+        "username":   KC_ADMIN_USER,
+        "password":   KC_ADMIN_PASS,
+    })
 
-clients_url = (f"{KC_URL}/admin/realms/{CONCERT_REALM}"
-               f"/clients?clientId=concert-client")
-status, clients_body = api_request("GET", clients_url, KC_ADMIN_TOKEN)
+    KC_ADMIN_TOKEN = body.get("access_token", "")
+    if not KC_ADMIN_TOKEN:
+        die(f"Failed to obtain KC admin token (HTTP {status}): "
+            f"{body.get('error_description', body.get('error', ''))}")
 
-if not isinstance(clients_body, list) or not clients_body:
-    die(f"concert-client not found in realm '{CONCERT_REALM}' (HTTP {status}).")
+    success(f"KC admin token obtained (HTTP {status}).")
 
-client_uuid = clients_body[0].get("id", "")
-if not client_uuid:
-    die("Could not extract concert-client UUID.")
+    # ---------------------------------------------------------------------------
+    # Step 4 — Retrieve concert-client secret from Keycloak admin API
+    # ---------------------------------------------------------------------------
 
-secret_url = (f"{KC_URL}/admin/realms/{CONCERT_REALM}"
-              f"/clients/{client_uuid}/client-secret")
-status, secret_body = api_request("GET", secret_url, KC_ADMIN_TOKEN)
+    print("Step 4: Retrieving concert-client secret ...")
 
-CLIENT_SECRET = secret_body.get("value", "")
-if not CLIENT_SECRET:
-    die(f"Could not retrieve concert-client secret (HTTP {status}): {secret_body}")
+    clients_url = (f"{KC_LOCAL_URL}/admin/realms/{CONCERT_REALM}"
+                   f"/clients?clientId=concert-client")
+    status, clients_body = api_request("GET", clients_url, KC_ADMIN_TOKEN)
 
-success(f"concert-client secret retrieved (client UUID: {client_uuid}).")
+    if not isinstance(clients_body, list) or not clients_body:
+        die(f"concert-client not found in realm '{CONCERT_REALM}' (HTTP {status}).")
 
-# ---------------------------------------------------------------------------
-# Step 5 — Validate user credentials via Keycloak
-# ---------------------------------------------------------------------------
+    client_uuid = clients_body[0].get("id", "")
+    if not client_uuid:
+        die("Could not extract concert-client UUID.")
 
-print(f"Step 5: Validating Concert user '{CONCERT_USERNAME}' ...")
+    secret_url = (f"{KC_LOCAL_URL}/admin/realms/{CONCERT_REALM}"
+                  f"/clients/{client_uuid}/client-secret")
+    status, secret_body = api_request("GET", secret_url, KC_ADMIN_TOKEN)
 
-status, body = http_post_form(TOKEN_EP_REALM, {
-    "grant_type":    "password",
-    "client_id":     "concert-client",
-    "client_secret": CLIENT_SECRET,
-    "username":      CONCERT_USERNAME,
-    "password":      CONCERT_PASSWORD,
-    "scope":         "openid",
-})
+    CLIENT_SECRET = secret_body.get("value", "")
+    if not CLIENT_SECRET:
+        die(f"Could not retrieve concert-client secret (HTTP {status}): {secret_body}")
 
-if not body.get("access_token"):
-    die(f"User authentication failed (HTTP {status}): "
-        f"{body.get('error_description', body.get('error', json.dumps(body)))}")
+    success(f"concert-client secret retrieved (client UUID: {client_uuid}).")
 
-success(f"User '{CONCERT_USERNAME}' validated (HTTP {status}).")
+    # ---------------------------------------------------------------------------
+    # Step 5 — Validate user credentials via Keycloak
+    # ---------------------------------------------------------------------------
+
+    print(f"Step 5: Validating Concert user '{CONCERT_USERNAME}' ...")
+
+    status, body = http_post_form(TOKEN_EP_REALM, {
+        "grant_type":    "password",
+        "client_id":     "concert-client",
+        "client_secret": CLIENT_SECRET,
+        "username":      CONCERT_USERNAME,
+        "password":      CONCERT_PASSWORD,
+        "scope":         "openid",
+    })
+
+    if not body.get("access_token"):
+        die(f"User authentication failed (HTTP {status}): "
+            f"{body.get('error_description', body.get('error', json.dumps(body)))}")
+
+    success(f"User '{CONCERT_USERNAME}' validated (HTTP {status}).")
+
+finally:
+    kc_pf_proc.terminate()
+    kc_pf_proc.wait()
 
 # ---------------------------------------------------------------------------
 # Step 6 — Obtain Hub-signed platform JWT via handle_login

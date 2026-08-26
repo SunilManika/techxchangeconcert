@@ -225,11 +225,15 @@ $(grep -c "BEGIN CERTIFICATE" "${BUNDLE_FILE}" 2>/dev/null || echo 0) cert(s)."
             echo "# Instana CA — appended by fix-instana-tls.sh" >> "${UPDATED_BUNDLE_FILE}"
             cat "${NEW_CERTS_FILE}" >> "${UPDATED_BUNDLE_FILE}"
 
-            # Patch the secret
+            # Patch the secret — write the JSON patch to a file to avoid
+            # "Argument list too long" when the CA bundle is large.
             NEW_B64=$(base64 -w0 < "${UPDATED_BUNDLE_FILE}")
+            PATCH_FILE="${TMPDIR_WORK}/tls-patch.json"
+            printf '[{"op":"replace","path":"/data/tls-ca-bundle.pem","value":"%s"}]' \
+                "${NEW_B64}" > "${PATCH_FILE}"
             oc patch secret "${TLS_SECRET}" -n "${CONCERT_NS}" \
                 --type=json \
-                --patch="[{\"op\":\"replace\",\"path\":\"/data/tls-ca-bundle.pem\",\"value\":\"${NEW_B64}\"}]"
+                --patch-file="${PATCH_FILE}"
 
             ok "Secret '${TLS_SECRET}' patched — TLS bundle updated with Instana CA."
         fi
