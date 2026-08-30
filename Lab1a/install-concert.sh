@@ -21,14 +21,14 @@ set -Eeuo pipefail
 #   4. Internet access is available to GitHub and IBM entitled registries.
 #
 # Typical usage:
-#   chmod +x install_ibm_concert_ocp.sh
-#   ./install_ibm_concert_ocp.sh
+#   chmod +x install-concert.sh
+#   ./install-concert.sh
 #
 # Non-interactive example:
 #   CONCERT_ADMIN_USER=admin \
 #   CONCERT_ADMIN_PASSWORD='StrongPassword' \
 #   IBM_ENTITLEMENT_KEY='...' \
-#   ./install_ibm_concert_ocp.sh
+#   ./install-concert.sh
 #
 # Optional overrides:
 #   CONCERT_VERSION=3.0.0
@@ -459,7 +459,12 @@ if bool_true "$CONFIGURE_SSO"; then
   fi
 
  ##############################################################################
- # Ensure Hub configuration uses the external Keycloak URL
+ # Ensure Hub OIDC configuration uses the external Keycloak route
+ #
+ # KEYCLOAK_URL must be the external OCP route so the Concert UI browser login
+ # redirect resolves correctly.  The solis-core TLS trust issue (Let's Encrypt
+ # not in the pod CA bundle) is fixed separately by appending the OCP ingress
+ # chain to app-cfg-internal-tls — see Lab1b/fix-concert-auth.sh.
  ##############################################################################
 
   if oc get configmap app-cfg-cm -n "$HUB_NS" >/dev/null 2>&1; then
@@ -473,6 +478,8 @@ if bool_true "$CONFIGURE_SSO"; then
       oc patch configmap app-cfg-cm -n "$HUB_NS" \
         --type merge \
         -p "{\"data\":{\"KEYCLOAK_URL\":\"${KC_URL}\",\"REALM_NAME\":\"${CONCERT_REALM}\",\"SOLIS_AUTH\":\"oidc\"}}"
+    else
+      log "Hub KEYCLOAK_URL already correct — no change needed."
     fi
   fi
 

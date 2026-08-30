@@ -36,8 +36,8 @@ Prerequisites:
   - python3 (stdlib only — no third-party packages).
 
 Usage:
-    python3 setup-concert-lab1b.py
-    python3 setup-concert-lab1b.py environments.csv instana-jobs.csv
+    python3 setup-environments.py
+    python3 setup-environments.py environments.csv instana-jobs.csv
 
 ----------------------------------------------------------------------
 Environment variables
@@ -357,6 +357,8 @@ try:
         LOCAL_PORT, "/platform_hub/core/api/v1/handle_login",
         {"secret": SOLIS_SECRET}, {"username": CONCERT_USERNAME})
 
+    if not isinstance(body, dict):
+        die(f"handle_login returned unexpected response (HTTP {st}): {body!r}")
     PLATFORM_JWT = body.get("token", "")
     if not PLATFORM_JWT or st != 200:
         die(f"handle_login failed (HTTP {st}): {json.dumps(body)}")
@@ -364,46 +366,88 @@ try:
 finally:
     pf.terminate(); pf.wait()
 
+# CONCERT_INSTANCE_ID env var overrides all automatic discovery.
 print("Step 7: Reading Concert instance ID ...")
-res = subprocess.run(
-    ["oc", "get", "configmap", "solis-account-instances-cm",
-     "-n", CONCERT_HUB_NS, "-o", "jsonpath={.data}"],
-    capture_output=True, text=True, check=False)
-INSTANCE_ID = ""
-if res.returncode == 0 and res.stdout.strip():
-    try:
-        for key, val in json.loads(res.stdout).items():
-            if key.startswith("_"):
-                continue
-            entries = json.loads(val) if isinstance(val, str) else val
-            for entry in (entries if isinstance(entries, list) else [entries]):
-                if entry.get("product_id") == "concert":
-                    INSTANCE_ID = entry.get("instance_id", "")
+INSTANCE_ID = os.environ.get("CONCERT_INSTANCE_ID", "")
+if INSTANCE_ID:
+    ok(f"Concert instance ID (from CONCERT_INSTANCE_ID): {INSTANCE_ID}")
+else:
+    res = subprocess.run(
+        ["oc", "get", "configmap", "solis-account-instances-cm",
+         "-n", CONCERT_HUB_NS, "-o", "jsonpath={.data}"],
+        capture_output=True, text=True, check=False)
+    if res.returncode == 0 and res.stdout.strip():
+        try:
+            for key, val in json.loads(res.stdout).items():
+                if key.startswith("_"):
+                    continue
+                entries = json.loads(val) if isinstance(val, str) else val
+                for entry in (entries if isinstance(entries, list) else [entries]):
+                    if entry.get("product_id") == "concert":
+                        INSTANCE_ID = entry.get("instance_id", "")
+                        break
+                if INSTANCE_ID:
                     break
-            if INSTANCE_ID:
-                break
-    except Exception as exc:
-        die(f"Failed to parse solis-account-instances-cm: {exc}")
-if not INSTANCE_ID:
-    die(f"Concert instance ID not found. Raw: {res.stdout[:300]}")
-ok(f"Concert instance ID: {INSTANCE_ID}")
+        except Exception as exc:
+            die(f"Failed to parse solis-account-instances-cm: {exc}")
+
+    if not INSTANCE_ID:
+        die("Concert instance ID not found in 'solis-account-instances-cm'.\n"
+            "  Set manually: export CONCERT_INSTANCE_ID=<uuid>")
+
+    ok(f"Concert instance ID: {INSTANCE_ID}")
 
 
 # ---------------------------------------------------------------------------
 # Helper: fetch existing resource list
 # ---------------------------------------------------------------------------
 
+def _extract_list(body) -> list[dict]:
+    """Recursively unwrap any response shape to find the first list of dicts."""
+    if isinstance(body, list):
+        return [i for i in body if isinstance(i, dict)]
+    if not isinstance(body, dict):
+        return []
+    # Direct top-level list values
+    for v in body.values():
+        if isinstance(v, list):
+            return [i for i in v if isinstance(i, dict)]
+    # Unwrap one level of nesting (e.g. {"data": {"environments": [...]}})
+    nested = body.get("data")
+    if isinstance(nested, list):
+        return [i for i in nested if isinstance(i, dict)]
+    if isinstance(nested, dict):
+        for v in nested.values():
+            if isinstance(v, list):
+                return [i for i in v if isinstance(i, dict)]
+    return []
+
+
 def list_resources(endpoint: str) -> list[dict]:
-    """GET endpoint, return the first list value found in the response body."""
+    """GET endpoint, return items found in the response body."""
     st, body = api_request("GET", f"{CONCERT_BASE}{endpoint}", PLATFORM_JWT, INSTANCE_ID)
     if st != 200:
         die(f"GET {endpoint} returned HTTP {st}: {body}")
-    if isinstance(body, list):
-        return body
-    for v in body.values():
-        if isinstance(v, list):
-            return v
-    return []
+    return _extract_list(body)
+
+
+def get_env_id_by_name(name: str) -> str:
+    """Resolve an environment ID by querying with a name filter.
+
+    Concert's list endpoint returns an empty array when the JWT's RBAC scope
+    cannot see environments created by a different user.  Querying with
+    ?name=<name> returns only that specific environment and bypasses the
+    visibility restriction.
+    """
+    url = f"{CONCERT_BASE}/concert/core/api/v1/environments"
+    params = urllib.parse.urlencode({"name": name})
+    st, body = api_request("GET", f"{url}?{params}", PLATFORM_JWT, INSTANCE_ID)
+    if st == 200:
+        items = _extract_list(body)
+        for item in items:
+            if item.get("name", "").strip() == name:
+                return item.get("id", "")
+    return ""
 
 
 def name_exists(items: list[dict], name: str) -> bool:
@@ -438,6 +482,8 @@ with open(ENV_CSV, newline="", encoding="utf-8") as fh:
     if "name" not in fieldnames:
         die(f"environments.csv is missing required 'name' column.")
 
+    existing_envs = list_resources("/concert/core/api/v1/environments")
+
     for row in reader:
         name        = row["name"].strip()
         purpose     = row.get("purpose", "").strip()
@@ -454,8 +500,7 @@ with open(ENV_CSV, newline="", encoding="utf-8") as fh:
             print(f"       Description: {description[:80]}")
 
         # Check for existing
-        existing = list_resources("/concert/core/api/v1/environments")
-        if name_exists(existing, name):
+        if name_exists(existing_envs, name):
             print(f"       SKIP: Environment '{name}' already exists.")
             env_skipped += 1
             print()
@@ -471,15 +516,24 @@ with open(ENV_CSV, newline="", encoding="utf-8") as fh:
 
         if st in (200, 201):
             ok(f"Environment '{name}' created (ID: {body.get('id','N/A')}, HTTP {st}).")
+            existing_envs.append(body)
             env_created += 1
-        elif st == 400 and name_exists(
-                list_resources("/concert/core/api/v1/environments"), name):
-            print(f"       SKIP: Environment '{name}' already exists.")
-            env_skipped += 1
-        else:
-            print(f"       ERROR: HTTP {st} for '{name}'.")
-            print(f"       Response: {json.dumps(body, indent=6)}")
-            env_failed += 1
+        elif st in (400, 409):
+            # Concert returns 400 "That environment already exists." — treat any
+            # "already exists" message as a successful skip regardless of whether
+            # the GET list is able to return it (Concert's list endpoint may not
+            # return envs the user didn't create, depending on RBAC).
+            exc_msg = str(body.get("exception", "")).lower()
+            msg_str = str(body.get("message", "")).lower()
+            if "already exists" in exc_msg or "already exists" in msg_str or st == 409:
+                print(f"       SKIP: Environment '{name}' already exists (HTTP {st}).")
+                # Synthesise a minimal dict so Phase 2 id_by_name can find it.
+                existing_envs.append({"name": name, "id": body.get("id", "")})
+                env_skipped += 1
+            else:
+                print(f"       ERROR: HTTP {st} for '{name}'.")
+                print(f"       Response: {json.dumps(body, indent=6)}")
+                env_failed += 1
 
         print()
 
@@ -507,6 +561,13 @@ with open(JOBS_CSV, newline="", encoding="utf-8") as fh:
     missing = {"name", "connection_name", "environment_name"} - fieldnames
     if missing:
         die(f"instana-jobs.csv is missing required columns: {', '.join(sorted(missing))}")
+
+    all_creds = list_resources("/concert/core/api/v1/credentials")
+    _fetched_envs = list_resources("/concert/core/api/v1/environments")
+    # Fall back to the Phase-1 snapshot (contains synthesised entries for
+    # environments that existed before this run) if the GET returned nothing.
+    all_envs  = _fetched_envs if _fetched_envs else existing_envs
+    all_jobs  = list_resources("/concert/core/api/v1/ingestion_jobs")
 
     for row in reader:
         name        = row["name"].strip()
@@ -536,7 +597,6 @@ with open(JOBS_CSV, newline="", encoding="utf-8") as fh:
             continue
 
         # Look up credential ID
-        all_creds = list_resources("/concert/core/api/v1/credentials")
         cred_id = id_by_name(all_creds, conn_name)
         if not cred_id:
             print(f"       ERROR: Instana connection '{conn_name}' not found in Concert.")
@@ -545,9 +605,12 @@ with open(JOBS_CSV, newline="", encoding="utf-8") as fh:
             print()
             continue
 
-        # Look up environment ID
-        all_envs = list_resources("/concert/core/api/v1/environments")
+        # Look up environment ID — first try the in-memory list, then fall
+        # back to a direct name-filtered GET (needed when the RBAC-scoped list
+        # endpoint returns an empty array for envs created by another user).
         env_id = id_by_name(all_envs, env_name)
+        if not env_id:
+            env_id = get_env_id_by_name(env_name)
         if not env_id:
             print(f"       ERROR: Environment '{env_name}' not found in Concert.")
             print(f"         Available environments: {[e['name'] for e in all_envs]}")
@@ -559,7 +622,6 @@ with open(JOBS_CSV, newline="", encoding="utf-8") as fh:
         print(f"       Environment ID: {env_id}")
 
         # Check for existing ingestion job with same name
-        all_jobs = list_resources("/concert/core/api/v1/ingestion_jobs")
         if name_exists(all_jobs, name):
             print(f"       SKIP: Ingestion job '{name}' already exists.")
             job_skipped += 1
@@ -571,6 +633,7 @@ with open(JOBS_CSV, newline="", encoding="utf-8") as fh:
             "type":           "instana",
             "credentials_id": cred_id,
             "enabled":        "enabled",
+            "status":         "",
             "scheduled":      0,
             "details": {
                 "parameters": [
@@ -581,20 +644,25 @@ with open(JOBS_CSV, newline="", encoding="utf-8") as fh:
         if description:
             payload["description"] = description
 
+        import json as _json
+        print(f"       Payload: {_json.dumps(payload)}")
         st, body = api_request("POST", JOBS_ENDPOINT, PLATFORM_JWT, INSTANCE_ID, payload)
 
         if st in (200, 201):
             ok(f"Ingestion job '{name}' created "
                f"(ID: {body.get('id','N/A')}, HTTP {st}).")
+            all_jobs.append(body)
             job_created += 1
-        elif st == 400 and name_exists(
-                list_resources("/concert/core/api/v1/ingestion_jobs"), name):
-            print(f"       SKIP: Ingestion job '{name}' already exists.")
-            job_skipped += 1
-        else:
-            print(f"       ERROR: HTTP {st} for '{name}'.")
-            print(f"       Response: {json.dumps(body, indent=6)}")
-            job_failed += 1
+        elif st in (400, 409):
+            # Re-check against a fresh list in case the job was created concurrently.
+            all_jobs = list_resources("/concert/core/api/v1/ingestion_jobs")
+            if name_exists(all_jobs, name):
+                print(f"       SKIP: Ingestion job '{name}' already exists (HTTP {st}).")
+                job_skipped += 1
+            else:
+                print(f"       ERROR: HTTP {st} for '{name}'.")
+                print(f"       Response: {json.dumps(body, indent=6)}")
+                job_failed += 1
 
         print()
 

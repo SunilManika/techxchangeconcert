@@ -1,2 +1,3 @@
 name,purpose,description
+retail-demo,production,Retail demo application environment for certificate and SBOM ingestion
 Testing,testing,Testing environment for Instana observability ingestion

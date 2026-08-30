@@ -1,10 +1,10 @@
 {
   "bomFormat": "CycloneDX",
   "specVersion": "1.6",
-  "serialNumber": "urn:uuid:7c74a07b-1c06-46a4-837e-ab31e9573fe3",
+  "serialNumber": "urn:uuid:78ef87c4-cbce-490c-be9b-7dbcd18985af",
   "version": 1,
   "metadata": {
-    "timestamp": "2026-08-25T13:27:49Z",
+    "timestamp": "2026-08-27T01:40:03Z",
     "tools": {
       "components": [
         {
@@ -86,28 +86,21 @@
   "components": [
     {
       "type": "library",
-      "bom-ref": "25ffeb15-cca1-4c61-80e0-33789cf4e6db",
-      "group": "org.jetbrains.lets-plot",
-      "name": "lets-plot-common",
-      "version": "4.0.0",
+      "bom-ref": "770393ee-2689-4077-b17b-c10ca56d8e33",
+      "group": "org.xmlresolver",
+      "name": "xmlresolver",
+      "version": "5.2.1",
       "hashes": [
         {
           "alg": "SHA-1",
-          "content": "5df5ac7834119e972b44789bf8f239d04e64faa4"
+          "content": "46b331b4dbe8985a11f7e29bc8fc64285ab7a104"
         }
       ],
-      "licenses": [
-        {
-          "license": {
-            "id": "MIT"
-          }
-        }
-      ],
-      "purl": "pkg:maven/org.jetbrains.lets-plot/lets-plot-common@4.0.0",
+      "purl": "pkg:maven/org.xmlresolver/xmlresolver@5.2.1",
       "properties": [
         {
           "name": "aquasecurity:trivy:FilePath",
-          "value": "opt/jmeter/lib/lets-plot-batik-4.1.0.jar"
+          "value": "opt/jmeter/lib/xmlresolver-5.2.1.jar"
         },
         {
           "name": "aquasecurity:trivy:LayerDiffID",
@@ -125,7 +118,7 @@
     },
     {
       "type": "operating-system",
-      "bom-ref": "4803ee02-b3bf-4ecd-94e8-3cae2f277aaf",
+      "bom-ref": "82636c0f-d92b-4784-b16b-e3566d0afaec",
       "name": "alpine",
       "version": "3.18.12",
       "properties": [
@@ -141,39 +134,7 @@
     },
     {
       "type": "library",
-      "bom-ref": "58a04eb2-6859-4c6c-bef1-38888edde1a3",
-      "group": "org.xmlresolver",
-      "name": "xmlresolver",
-      "version": "5.2.1",
-      "hashes": [
-        {
-          "alg": "SHA-1",
-          "content": "1f4142d5ed8bbb95d470ca77fc1ffae81e572291"
-        }
-      ],
-      "purl": "pkg:maven/org.xmlresolver/xmlresolver@5.2.1",
-      "properties": [
-        {
-          "name": "aquasecurity:trivy:FilePath",
-          "value": "opt/jmeter/lib/xmlresolver-5.2.1-data.jar"
-        },
-        {
-          "name": "aquasecurity:trivy:LayerDiffID",
-          "value": "sha256:bbbc89957d88106c3d194bf02b56d6089b8656c0c45a8cf8aff0bc5ed9ef3503"
-        },
-        {
-          "name": "aquasecurity:trivy:LayerDigest",
-          "value": "sha256:33dd5f8b9f24085079a0d428c5a61a0a04c3b0db5b73af692767dfb815997072"
-        },
-        {
-          "name": "aquasecurity:trivy:PkgType",
-          "value": "jar"
-        }
-      ]
-    },
-    {
-      "type": "library",
-      "bom-ref": "5978e625-2624-404e-8c7a-da16884b7fb4",
+      "bom-ref": "cf094519-cafc-4f3d-9c40-d33ce0926cea",
       "group": "org.jetbrains.lets-plot",
       "name": "lets-plot-common",
       "version": "4.0.0",
@@ -212,21 +173,60 @@
     },
     {
       "type": "library",
-      "bom-ref": "aff7fdba-cb1a-4f65-b497-1d226ecdb1c2",
+      "bom-ref": "ec4a850c-e70f-457b-a5fd-e69a498d5453",
+      "group": "org.jetbrains.lets-plot",
+      "name": "lets-plot-common",
+      "version": "4.0.0",
+      "hashes": [
+        {
+          "alg": "SHA-1",
+          "content": "5df5ac7834119e972b44789bf8f239d04e64faa4"
+        }
+      ],
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
+      "purl": "pkg:maven/org.jetbrains.lets-plot/lets-plot-common@4.0.0",
+      "properties": [
+        {
+          "name": "aquasecurity:trivy:FilePath",
+          "value": "opt/jmeter/lib/lets-plot-batik-4.1.0.jar"
+        },
+        {
+          "name": "aquasecurity:trivy:LayerDiffID",
+          "value": "sha256:bbbc89957d88106c3d194bf02b56d6089b8656c0c45a8cf8aff0bc5ed9ef3503"
+        },
+        {
+          "name": "aquasecurity:trivy:LayerDigest",
+          "value": "sha256:33dd5f8b9f24085079a0d428c5a61a0a04c3b0db5b73af692767dfb815997072"
+        },
+        {
+          "name": "aquasecurity:trivy:PkgType",
+          "value": "jar"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "f980a4e8-5dec-41d8-b94c-5c533e09f842",
       "group": "org.xmlresolver",
       "name": "xmlresolver",
       "version": "5.2.1",
       "hashes": [
         {
           "alg": "SHA-1",
-          "content": "46b331b4dbe8985a11f7e29bc8fc64285ab7a104"
+          "content": "1f4142d5ed8bbb95d470ca77fc1ffae81e572291"
         }
       ],
       "purl": "pkg:maven/org.xmlresolver/xmlresolver@5.2.1",
       "properties": [
         {
           "name": "aquasecurity:trivy:FilePath",
-          "value": "opt/jmeter/lib/xmlresolver-5.2.1.jar"
+          "value": "opt/jmeter/lib/xmlresolver-5.2.1-data.jar"
         },
         {
           "name": "aquasecurity:trivy:LayerDiffID",
@@ -9069,10 +9069,10 @@
   ],
   "dependencies": [
     {
-      "ref": "25ffeb15-cca1-4c61-80e0-33789cf4e6db"
+      "ref": "770393ee-2689-4077-b17b-c10ca56d8e33"
     },
     {
-      "ref": "4803ee02-b3bf-4ecd-94e8-3cae2f277aaf",
+      "ref": "82636c0f-d92b-4784-b16b-e3566d0afaec",
       "dependsOn": [
         "pkg:apk/alpine/alpine-baselayout@3.4.3-r1?arch=x86_64\u0026distro=3.18.12",
         "pkg:apk/alpine/alpine-keys@2.4-r1?arch=x86_64\u0026distro=3.18.12",
@@ -9086,13 +9086,13 @@
       ]
     },
     {
-      "ref": "58a04eb2-6859-4c6c-bef1-38888edde1a3"
+      "ref": "cf094519-cafc-4f3d-9c40-d33ce0926cea"
     },
     {
-      "ref": "5978e625-2624-404e-8c7a-da16884b7fb4"
+      "ref": "ec4a850c-e70f-457b-a5fd-e69a498d5453"
     },
     {
-      "ref": "aff7fdba-cb1a-4f65-b497-1d226ecdb1c2"
+      "ref": "f980a4e8-5dec-41d8-b94c-5c533e09f842"
     },
     {
       "ref": "pkg:apk/alpine/alpine-baselayout-data@3.4.3-r1?arch=x86_64\u0026distro=3.18.12"
@@ -9967,11 +9967,11 @@
     {
       "ref": "pkg:oci/retail-jmeter@sha256:d5091b8d603460b7095477f43c23ddd91a25095e46fd92d2c189789a7f6c4fa5?arch=amd64\u0026repository_url=index.docker.io%2Fsunilmanika%2Fretail-jmeter",
       "dependsOn": [
-        "25ffeb15-cca1-4c61-80e0-33789cf4e6db",
-        "4803ee02-b3bf-4ecd-94e8-3cae2f277aaf",
-        "58a04eb2-6859-4c6c-bef1-38888edde1a3",
-        "5978e625-2624-404e-8c7a-da16884b7fb4",
-        "aff7fdba-cb1a-4f65-b497-1d226ecdb1c2",
+        "770393ee-2689-4077-b17b-c10ca56d8e33",
+        "82636c0f-d92b-4784-b16b-e3566d0afaec",
+        "cf094519-cafc-4f3d-9c40-d33ce0926cea",
+        "ec4a850c-e70f-457b-a5fd-e69a498d5453",
+        "f980a4e8-5dec-41d8-b94c-5c533e09f842",
         "pkg:maven/bsf/bsf@2.4.0",
         "pkg:maven/com.fasterxml.jackson.core/jackson-annotations@2.16.1",
         "pkg:maven/com.fasterxml.jackson.core/jackson-core@2.16.1",
@@ -12621,6 +12621,9 @@
           "url": "https://access.redhat.com/errata/RHSA-2026:40895"
         },
         {
+          "url": "https://access.redhat.com/errata/RHSA-2026:43400"
+        },
+        {
           "url": "https://access.redhat.com/security/cve/CVE-2026-54512"
         },
         {
@@ -12648,7 +12651,7 @@
           "url": "https://errata.almalinux.org/9/ALSA-2026-40895.html"
         },
         {
-          "url": "https://errata.rockylinux.org/RLSA-2026:40895"
+          "url": "https://errata.rockylinux.org/RLSA-2026:43400"
         },
         {
           "url": "https://github.com/FasterXML/jackson-databind"
@@ -12836,7 +12839,7 @@
           "url": "https://errata.almalinux.org/9/ALSA-2026-40895.html"
         },
         {
-          "url": "https://errata.rockylinux.org/RLSA-2026:40895"
+          "url": "https://errata.rockylinux.org/RLSA-2026:43400"
         },
         {
           "url": "https://github.com/FasterXML/jackson-databind"
@@ -12876,7 +12879,7 @@
         }
       ],
       "published": "2026-06-23T21:17:02Z",
-      "updated": "2026-08-14T13:19:03Z",
+      "updated": "2026-08-26T13:19:15Z",
       "affects": [
         {
           "ref": "pkg:maven/com.fasterxml.jackson.core/jackson-databind@2.16.1",

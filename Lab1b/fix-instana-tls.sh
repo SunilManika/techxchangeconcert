@@ -31,7 +31,7 @@
 # SCOPE
 # -----
 # These are the ONLY cluster-level changes made by the Lab1b scripts.
-# `create-instana-connection.py` and `setup-concert-lab1b.py` are
+# `create-connections.py` and `setup-environments.py` are
 # read-only with respect to the cluster — they only call Concert REST APIs.
 #
 # PREREQUISITES
@@ -114,6 +114,7 @@ APPDB_SECRET="${APPDB_SECRET:-app-cfg-oob-secret}"
 APPDB_SERVICE="${APPDB_SERVICE:-ibm-roja-appdb-svc}"
 APPDB_NAME="${APPDB_NAME:-appdb}"
 APPDB_SCHEMA="${APPDB_SCHEMA:-ibm_roja_app}"
+HUB_NS="${HUB_NS:-concert-hub}"
 TLS_SECRET="app-cfg-internal-tls"
 TLS_KEY="tls-ca-bundle.pem"
 TMPDIR_WORK=$(mktemp -d)
@@ -129,6 +130,7 @@ echo "  Instana URL      : ${INSTANA_URL}"
 echo "  Instana Host     : ${INSTANA_HOST}:${INSTANA_PORT}"
 echo "  Credential name  : ${CREDENTIAL_NAME}"
 echo "  Concert namespace: ${CONCERT_NS}"
+echo "  Hub namespace    : ${HUB_NS}"
 echo "  AppDB secret     : ${APPDB_SECRET}"
 echo "  TLS secret       : ${TLS_SECRET}"
 echo ""
@@ -183,7 +185,7 @@ else
         warn "Skipping TLS bundle patch."
     else
         BUNDLE_FILE="${TMPDIR_WORK}/existing-bundle.pem"
-        echo "${BUNDLE_B64}" | base64 -d > "${BUNDLE_FILE}"
+        echo "${BUNDLE_B64}" | python3 -c "import sys,base64; sys.stdout.buffer.write(base64.b64decode(sys.stdin.read().strip()))" > "${BUNDLE_FILE}"
         ok "Current bundle: $(wc -l < "${BUNDLE_FILE}") lines, \
 $(grep -c "BEGIN CERTIFICATE" "${BUNDLE_FILE}" 2>/dev/null || echo 0) cert(s)."
 
@@ -227,7 +229,7 @@ $(grep -c "BEGIN CERTIFICATE" "${BUNDLE_FILE}" 2>/dev/null || echo 0) cert(s)."
 
             # Patch the secret — write the JSON patch to a file to avoid
             # "Argument list too long" when the CA bundle is large.
-            NEW_B64=$(base64 -w0 < "${UPDATED_BUNDLE_FILE}")
+            NEW_B64=$(python3 -c "import sys,base64; print(base64.b64encode(open('${UPDATED_BUNDLE_FILE}','rb').read()).decode(),end='')")
             PATCH_FILE="${TMPDIR_WORK}/tls-patch.json"
             printf '[{"op":"replace","path":"/data/tls-ca-bundle.pem","value":"%s"}]' \
                 "${NEW_B64}" > "${PATCH_FILE}"
@@ -246,44 +248,37 @@ fi
 banner "Change 2: Writing insecure_ssl:true to appdb (credential: '${CREDENTIAL_NAME}')"
 
 # --- Step 2a: Read DB credentials from the OCP secret
+# Keys: APPDB_USER, APPDB_PASSWORD, APPDB_DBNAME
 info "Reading DB credentials from secret '${APPDB_SECRET}' ..."
 
-DB_USER=""
-for KEY in DB_USER db-user username POSTGRES_USER; do
-    VAL=$(oc get secret "${APPDB_SECRET}" -n "${CONCERT_NS}" \
-          -o "jsonpath={.data.${KEY}}" 2>/dev/null || echo "")
-    if [[ -n "$VAL" ]]; then
-        DB_USER=$(echo "$VAL" | base64 -d 2>/dev/null || echo "")
-        [[ -n "$DB_USER" ]] && break
-    fi
-done
+# Use oc get -o json and python3 to decode — avoids base64 flag differences
+# between macOS (base64 -D) and Linux (base64 -d) when run under pipefail.
+_decode_secret_key() {
+    local key="$1"
+    oc get secret "${APPDB_SECRET}" -n "${CONCERT_NS}" -o json 2>/dev/null \
+        | python3 -c "
+import sys, json, base64
+d = json.load(sys.stdin).get('data', {})
+v = d.get('${key}', '')
+print(base64.b64decode(v).decode() if v else '', end='')
+" 2>/dev/null || echo ""
+}
 
-DB_PASS=""
-for KEY in DB_PASSWORD db-password password POSTGRES_PASSWORD; do
-    VAL=$(oc get secret "${APPDB_SECRET}" -n "${CONCERT_NS}" \
-          -o "jsonpath={.data.${KEY}}" 2>/dev/null || echo "")
-    if [[ -n "$VAL" ]]; then
-        DB_PASS=$(echo "$VAL" | base64 -d 2>/dev/null || echo "")
-        [[ -n "$DB_PASS" ]] && break
-    fi
-done
+DB_USER=$(_decode_secret_key APPDB_USER)
+DB_PASS=$(_decode_secret_key APPDB_PASSWORD)
+DB_NAME=$(_decode_secret_key APPDB_DBNAME)
+DB_NAME="${DB_NAME:-${APPDB_NAME}}"
 
 if [[ -z "$DB_USER" || -z "$DB_PASS" ]]; then
     warn "Could not read DB credentials from secret '${APPDB_SECRET}'."
     warn "Skipping insecure_ssl DB patch."
 else
-    ok "DB user: ${DB_USER}"
+    ok "DB user: ${DB_USER}  DB name: ${DB_NAME}"
 
-    # --- Step 2b: Locate the appdb pod
+    # --- Step 2b: Locate the appdb pod (pod name is roja-postgres-appdb-*)
     APPDB_POD=$(oc get pods -n "${CONCERT_NS}" \
         -o "jsonpath={range .items[*]}{.metadata.name}{\"\n\"}{end}" 2>/dev/null \
-        | grep "ibm-roja-appdb-" | head -1 || echo "")
-
-    if [[ -z "$APPDB_POD" ]]; then
-        APPDB_POD=$(oc get pods -n "${CONCERT_NS}" \
-            -o "jsonpath={range .items[*]}{.metadata.name}{\"\n\"}{end}" 2>/dev/null \
-            | grep "appdb" | head -1 || echo "")
-    fi
+        | grep -E "roja-postgres-appdb-|ibm-roja-appdb-" | head -1 || echo "")
 
     if [[ -z "$APPDB_POD" ]]; then
         warn "AppDB pod not found in namespace '${CONCERT_NS}' — skipping insecure_ssl DB patch."
@@ -291,17 +286,16 @@ else
         ok "AppDB pod: ${APPDB_POD}"
 
         # --- Step 2c: Run psql UPDATE inside the pod
-        SQL="UPDATE ${APPDB_SCHEMA}.credentials \
-SET credentials = credentials || '{\"insecure_ssl\":\"true\"}'::jsonb \
-WHERE name = '${CREDENTIAL_NAME}';"
-
+        # Feed SQL via stdin to avoid shell-quoting issues with JSON braces
+        # when passing through oc exec → sh -c → psql layers.
         info "Running psql UPDATE for credential '${CREDENTIAL_NAME}' ..."
-        PSQL_OUTPUT=$(oc exec -n "${CONCERT_NS}" "${APPDB_POD}" -- sh -c \
+        PSQL_OUTPUT=$(echo "UPDATE ${APPDB_SCHEMA}.credentials SET credentials = credentials || '{\"insecure_ssl\":\"true\"}'::jsonb WHERE name = '${CREDENTIAL_NAME}';" \
+            | oc exec -i -n "${CONCERT_NS}" "${APPDB_POD}" -- sh -c \
             "PGPASSWORD='${DB_PASS}' psql \
              -h ${APPDB_SERVICE}.${CONCERT_NS}.svc \
              -U ${DB_USER} \
-             -d ${APPDB_NAME} \
-             -c \"${SQL}\"" 2>&1 || true)
+             -d ${DB_NAME}" \
+            2>&1 || true)
 
         if echo "${PSQL_OUTPUT}" | grep -q "UPDATE 0"; then
             warn "psql UPDATE affected 0 rows — credential '${CREDENTIAL_NAME}' may not exist yet."
@@ -322,14 +316,15 @@ banner "Change 3: Restarting Concert application pods"
 
 info "This picks up the updated '${TLS_KEY}' secret mount in running pods."
 
+# Concert 3.0.x deployment names (covers all known variants):
 RESTARTED=()
-for DEP in ibm-roja-app ibm-roja-ingestion-processor; do
+for DEP in roja-ingestion rojacore roja-mgmt roja-pipeline roja-compliance \
+           roja-buddy roja-g-fwk roja-py-utils roja-sra roja-mcp \
+           ibm-roja-app ibm-roja-ingestion-processor; do
     if oc get deployment "${DEP}" -n "${CONCERT_NS}" >/dev/null 2>&1; then
         oc rollout restart "deployment/${DEP}" -n "${CONCERT_NS}"
         ok "Rollout restart triggered: deployment/${DEP}"
         RESTARTED+=("$DEP")
-    else
-        info "deployment/${DEP} not found — skipping."
     fi
 done
 
@@ -346,6 +341,55 @@ else
 fi
 
 # =============================================================================
+# CHANGE 4 — Verify Concert instance ID is accessible to the Hub.
+#
+# When Concert is installed with ENABLE_CROSS_PRODUCT_INTEGRATION=false (the
+# default), the instance ID remains 0000-0000-0000-0000 throughout the system.
+# This is the correct, working value — not a placeholder — and must be used as-is
+# for all Concert API calls (instance-id header, JWT account_id, appdb routing).
+#
+# This change ensures solis-account-instances-cm has a 0000-0000-0000-0000.json
+# key (which ibm-solis-core mounts as a file) so that JWT lookups succeed.
+# =============================================================================
+banner "Change 4: Verifying Concert instance ID in Hub configmap"
+
+INSTANCE_URL="https://ibm-concert-internal-solis-gw-svc.${CONCERT_NS}.svc.cluster.local:20443"
+INSTANCES_JSON=$(python3 -c "
+import json
+data = [
+  {'product_id': 'concert',   'instance_id': '0000-0000-0000-0000', 'instance_url': '${INSTANCE_URL}'},
+  {'product_id': 'dataapps',  'instance_id': '0000-0000-0000-0000', 'instance_url': 'https://ibm-dataapps-solis-gw-svc.concert-dataapps.svc.cluster.local:15443'},
+  {'product_id': 'workflows', 'instance_id': '0000-0000-0000-0000', 'instance_url': 'https://solis-gw.concert-workflows.svc.cluster.local:443'}
+]
+print(json.dumps(json.dumps(data)))
+")
+
+# Ensure the 0000 key exists (ibm-solis-core opens this file for JWT account lookup)
+EXISTING=$(oc get configmap solis-account-instances-cm -n "${HUB_NS}" \
+    -o jsonpath='{.data.0000-0000-0000-0000\.json}' 2>/dev/null || echo "")
+
+if [[ -z "$EXISTING" ]]; then
+    info "Adding 0000-0000-0000-0000.json key to solis-account-instances-cm ..."
+    oc patch configmap solis-account-instances-cm -n "${HUB_NS}" --type=json \
+        -p "[{\"op\":\"add\",\"path\":\"/data/0000-0000-0000-0000.json\",\"value\":${INSTANCES_JSON}}]" \
+      && ok "solis-account-instances-cm patched." \
+      || warn "Failed to patch solis-account-instances-cm."
+
+    info "Restarting ibm-solis-core to pick up new configmap mount ..."
+    oc rollout restart deployment/ibm-solis-core -n "${HUB_NS}" >/dev/null 2>&1 || true
+    oc rollout status  deployment/ibm-solis-core -n "${HUB_NS}" --timeout=180s \
+      && ok "ibm-solis-core restarted." \
+      || warn "ibm-solis-core rollout timed out — check manually."
+else
+    ok "solis-account-instances-cm already has 0000-0000-0000-0000.json key."
+fi
+
+echo ""
+echo "  Concert instance ID: 0000-0000-0000-0000"
+echo "  (No export needed — scripts read this automatically from the configmap)"
+echo ""
+
+# =============================================================================
 # Summary
 # =============================================================================
 echo ""
@@ -355,13 +399,20 @@ echo "================================================================"
 echo "  Instana URL      : ${INSTANA_URL}"
 echo "  Credential name  : ${CREDENTIAL_NAME}"
 echo "  Concert namespace: ${CONCERT_NS}"
+echo "  Hub namespace    : ${HUB_NS}"
 echo ""
 echo "  Changes applied:"
 echo "    1. TLS CA bundle  : secret/${TLS_SECRET} (namespace: ${CONCERT_NS})"
 echo "    2. AppDB row      : ${APPDB_SCHEMA}.credentials WHERE name='${CREDENTIAL_NAME}'"
 echo "    3. Pod restarts   : ${RESTARTED[*]:-none}"
+echo "    4. Instance reg   : solis-account-instances-cm (namespace: ${HUB_NS})"
 echo "================================================================"
 echo ""
-echo "  Next step: run the credential provisioning script"
-echo "    python3 create-instana-connection.py instana-connections.csv"
+echo "  Concert instance ID : 0000-0000-0000-0000"
+echo "  (Do NOT export CONCERT_INSTANCE_ID — scripts read this automatically)"
+echo ""
+echo "  Next steps:"
+echo "    python3 create-connections.py instana-connections.csv"
+echo "    python3 setup-environments.py environments.csv instana-jobs.csv"
+echo "    python3 upload-certificates.py"
 echo ""

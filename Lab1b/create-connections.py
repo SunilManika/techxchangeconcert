@@ -52,8 +52,8 @@ Reference:
     api/API--concert--ibm-concert-api-v3-0-0-0#create_credential
 
 Usage:
-    python3 create-instana-connection.py
-    python3 create-instana-connection.py instana-connections.csv
+    python3 create-connections.py
+    python3 create-connections.py instana-connections.csv
 
 ----------------------------------------------------------------------
 Environment variables
@@ -197,14 +197,14 @@ def api_request(
         die(f"Concert API unreachable at {url}: {exc.reason}")
 
 
-def http_post_json_local(port: int, path: str, headers: dict, payload: dict) -> tuple[int, dict]:
+def http_post_json_local(port: int, path: str, extra_headers: dict, payload: dict) -> tuple[int, dict]:
     """POST JSON to an HTTPS endpoint on localhost (port-forward), skip TLS verify."""
     url = f"https://localhost:{port}{path}"
     data = json.dumps(payload).encode()
     req = urllib.request.Request(url, data=data, headers={
         "Content-Type": "application/json",
         "Accept":       "application/json",
-        **headers,
+        **extra_headers,
     }, method="POST")
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
@@ -474,6 +474,8 @@ try:
         {"username": CONCERT_USERNAME},
     )
 
+    if not isinstance(body, dict):
+        die(f"handle_login returned unexpected response (HTTP {status}): {body!r}")
     PLATFORM_JWT = body.get("token", "")
     if not PLATFORM_JWT or status != 200:
         die(f"handle_login failed (HTTP {status}): {json.dumps(body)}")
@@ -489,39 +491,39 @@ finally:
 # Step 7 — Read Concert instance ID from OpenShift configmap
 # ---------------------------------------------------------------------------
 
+# CONCERT_INSTANCE_ID env var overrides all automatic discovery.
 print("Step 7: Reading Concert instance ID from OpenShift ...")
-
-result = subprocess.run(
-    ["oc", "get", "configmap", "solis-account-instances-cm",
-     "-n", CONCERT_HUB_NS,
-     "-o", "jsonpath={.data}"],
-    capture_output=True, text=True, check=False,
-)
-
-INSTANCE_ID = ""
-if result.returncode == 0 and result.stdout.strip():
-    try:
-        cm_data = json.loads(result.stdout.strip())
-        for key, val in cm_data.items():
-            if key.startswith("_"):
-                continue
-            entries = json.loads(val) if isinstance(val, str) else val
-            for entry in (entries if isinstance(entries, list) else [entries]):
-                if entry.get("product_id") == "concert":
-                    INSTANCE_ID = entry.get("instance_id", "")
-                    break
-            if INSTANCE_ID:
-                break
-    except Exception as exc:
-        die(f"Failed to parse solis-account-instances-cm: {exc}")
-
-if not INSTANCE_ID:
-    die(
-        "Concert instance ID not found in 'solis-account-instances-cm'.\n"
-        f"  Raw output: {result.stdout[:300]}"
+INSTANCE_ID = os.environ.get("CONCERT_INSTANCE_ID", "")
+if INSTANCE_ID:
+    success(f"Concert instance ID (from CONCERT_INSTANCE_ID): {INSTANCE_ID}")
+else:
+    result = subprocess.run(
+        ["oc", "get", "configmap", "solis-account-instances-cm",
+         "-n", CONCERT_HUB_NS,
+         "-o", "jsonpath={.data}"],
+        capture_output=True, text=True, check=False,
     )
+    if result.returncode == 0 and result.stdout.strip():
+        try:
+            cm_data = json.loads(result.stdout.strip())
+            for key, val in cm_data.items():
+                if key.startswith("_"):
+                    continue
+                entries = json.loads(val) if isinstance(val, str) else val
+                for entry in (entries if isinstance(entries, list) else [entries]):
+                    if entry.get("product_id") == "concert":
+                        INSTANCE_ID = entry.get("instance_id", "")
+                        break
+                if INSTANCE_ID:
+                    break
+        except Exception as exc:
+            die(f"Failed to parse solis-account-instances-cm: {exc}")
 
-success(f"Concert instance ID: {INSTANCE_ID}")
+    if not INSTANCE_ID:
+        die("Concert instance ID not found in 'solis-account-instances-cm'.\n"
+            "  Set manually: export CONCERT_INSTANCE_ID=<uuid>")
+
+    success(f"Concert instance ID: {INSTANCE_ID}")
 
 # ---------------------------------------------------------------------------
 # Step 8 — Process CSV and create each Instana connection
@@ -540,17 +542,6 @@ success(f"Concert instance ID: {INSTANCE_ID}")
 # ---------------------------------------------------------------------------
 
 CREDENTIALS_URL = f"{CONCERT_BASE}/concert/core/api/v1/credentials"
-
-
-def credential_name_exists(url: str, token: str, instance_id: str, name: str) -> tuple[bool, str]:
-    """Return (exists, credential_id) for a credential matching name."""
-    st, body = api_request("GET", url, token, instance_id)
-    if st != 200:
-        return False, ""
-    for cred in body.get("credentials", []):
-        if cred.get("name", "").strip() == name:
-            return True, cred.get("id", "")
-    return False, ""
 
 
 print()
@@ -617,16 +608,41 @@ with open(CSV_FILE, newline="", encoding="utf-8") as fh:
             success(f"Connection '{name}' created "
                     f"(ID: {credential_id}, HTTP {status}).")
             created += 1
-        elif status == 409 or (
-            status == 400
-            and credential_name_exists(CREDENTIALS_URL, PLATFORM_JWT, INSTANCE_ID, name)[0]
-        ):
-            _, cred_id = credential_name_exists(CREDENTIALS_URL, PLATFORM_JWT, INSTANCE_ID, name)
-            print(f"      SKIP: Connection '{name}' already exists (ID: {cred_id}).")
-            skipped += 1
-        else:
-            print(f"      ERROR: Unexpected HTTP {status} for '{name}'.")
-            print(f"      Response: {json.dumps(body, indent=6)}")
+        elif status == 409:
+            # 409 Conflict — credential already exists.  Verify via GET to get
+            # the existing ID and confirm it is the same connection.
+            get_st, get_body = api_request("GET", CREDENTIALS_URL, PLATFORM_JWT, INSTANCE_ID)
+            exists = False
+            cred_id = ""
+            if get_st == 200:
+                for cred in get_body.get("credentials", []):
+                    if cred.get("name", "").strip() == name:
+                        exists = True
+                        cred_id = cred.get("id", "")
+                        break
+            if exists:
+                print(f"      SKIP: Connection '{name}' already exists (ID: {cred_id}).")
+                skipped += 1
+            else:
+                print(f"      ERROR: HTTP 409 but credential '{name}' not found in GET response.")
+                print(f"      POST response: {json.dumps(body, indent=6)}")
+                failed += 1
+        elif status in (400, 500):
+            # 400 Bad Request — payload invalid, invalid/insufficient API key, or
+            #                   Concert cannot reach the Instana endpoint.
+            # 500 Internal Server Error — real server-side failure, not a duplicate.
+            # Do not silently skip; report the full error so the user can act on it.
+            msg = body.get("exception") or body.get("message") or ""
+            print(f"      ERROR: HTTP {status} creating connection '{name}'.")
+            if "invalid" in msg.lower() or "insufficient" in msg.lower() or "permission" in msg.lower():
+                print(f"      The Instana API key was rejected by Concert.")
+                print(f"      Check that the key is valid and has sufficient permissions")
+                print(f"      (Infrastructure & Platform data + Service/Endpoint mapping read access).")
+            else:
+                print(f"      This may mean Concert could not reach the Instana endpoint,")
+                print(f"      or the request payload was malformed.")
+                print(f"      Verify instana_url is reachable from the cluster, then re-run.")
+            print(f"      POST response: {json.dumps(body, indent=6)}")
             failed += 1
 
         print()

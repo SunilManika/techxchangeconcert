@@ -72,8 +72,8 @@ oc get ns "$HUB_NS" >/dev/null 2>&1 || die "Namespace '$HUB_NS' does not exist."
 oc get ns "$CONCERT_NS" >/dev/null 2>&1 || die "Namespace '$CONCERT_NS' does not exist."
 oc get svc "$HUB_SERVICE" -n "$HUB_NS" >/dev/null 2>&1 || die "Service '$HUB_SERVICE' not found in '$HUB_NS'."
 
-[[ -x "$ROUTE_SCRIPT" ]] || die "Route script not found/executable: $ROUTE_SCRIPT"
-[[ -x "$SETUP_KEYCLOAK_SCRIPT" ]] || die "Keycloak setup script not found/executable: $SETUP_KEYCLOAK_SCRIPT"
+[[ -x "$ROUTE_SCRIPT" ]] || warn "Route script not found/executable: $ROUTE_SCRIPT — will skip route creation."
+[[ -x "$SETUP_KEYCLOAK_SCRIPT" ]] || warn "Keycloak setup script not found/executable: $SETUP_KEYCLOAK_SCRIPT — realm init will be skipped."
 
 CONCERT_HOST="$(oc get route concert -n "$CONCERT_NS" -o jsonpath='{.spec.host}' 2>/dev/null || true)"
 [[ -n "$CONCERT_HOST" ]] || die "Concert route 'concert' not found in namespace '$CONCERT_NS'."
@@ -87,9 +87,11 @@ log "Concert URL: $CONCERT_URL"
 
 if oc get route "$HUB_ROUTE_NAME" -n "$HUB_NS" >/dev/null 2>&1; then
   log "Hub route '$HUB_ROUTE_NAME' already exists; reusing it."
-else
+elif [[ -x "$ROUTE_SCRIPT" ]]; then
   log "Creating IBM Solis Hub route using $ROUTE_SCRIPT ..."
   "$ROUTE_SCRIPT" "$HUB_NS"
+else
+  die "Hub route '$HUB_ROUTE_NAME' does not exist and route script is not available. Create the route manually."
 fi
 
 HUB_HOST="$(oc get route "$HUB_ROUTE_NAME" -n "$HUB_NS" -o jsonpath='{.spec.host}')"
@@ -151,6 +153,10 @@ if [[ "$REALM_CODE" == "200" ]]; then
 else
   log "Realm '$REALM' does not exist. Initializing Concert Keycloak authentication."
 
+  if [[ ! -x "$SETUP_KEYCLOAK_SCRIPT" ]]; then
+    die "Realm '$REALM' does not exist and setup-keycloak script is not available at $SETUP_KEYCLOAK_SCRIPT. Cannot continue."
+  fi
+
   PRODUCT_ADMIN_USERNAME="${PRODUCT_ADMIN_USERNAME:-admin}"
   if [[ -z "${PRODUCT_ADMIN_PASSWORD:-}" ]]; then
     read -r -s -p "Enter initial Concert platform admin password for '${PRODUCT_ADMIN_USERNAME}': " PRODUCT_ADMIN_PASSWORD
@@ -176,7 +182,12 @@ else
 fi
 
 ###############################################################################
-# 5. Ensure Hub OIDC config uses the external route
+# 5. Ensure Hub OIDC config uses the external Keycloak route
+#
+# KEYCLOAK_URL must be the external OCP route so the Concert UI browser login
+# redirect resolves correctly.  The solis-core TLS trust issue (Let's Encrypt
+# not in the pod CA bundle) is fixed separately by appending the OCP ingress
+# chain to app-cfg-internal-tls — see Lab1b/fix-concert-auth.sh.
 ###############################################################################
 
 log "Ensuring Hub OIDC configuration points to external Keycloak route ..."
@@ -241,7 +252,95 @@ UPDATE_CODE="$(curl -ksS \
 success "Concert client redirect URI ensured: $FULL_REDIRECT_URI"
 
 ###############################################################################
-# 7. Restart required Hub and Concert deployments
+# 6b. Ensure oidc-group-membership-mapper exists on concert-client
+#
+# ibm-solis-core (SOLIS_AUTH=oidc) reads the user's role by looking for a
+# "groups" claim in the Keycloak OIDC token.  Without this mapper Keycloak
+# never includes group membership in the token, so handle_login always returns
+# "role":"User" regardless of the user's Keycloak group membership — causing
+# HTTP 401 "instance ID Not Found" on every ingestion upload.
+###############################################################################
+
+log "Ensuring oidc-group-membership-mapper exists on '${CLIENT_ID}' ..."
+
+EXISTING_MAPPER="$(curl -ksS \
+  "${KC_URL}/admin/realms/${REALM}/clients/${CLIENT_UUID}/protocol-mappers/models" \
+  -H "Authorization: Bearer ${ACCESS_TOKEN}" \
+  | jq -r '.[] | select(.protocolMapper=="oidc-group-membership-mapper") | .id // empty' \
+  | head -1)"
+
+if [[ -n "$EXISTING_MAPPER" ]]; then
+  log "oidc-group-membership-mapper already exists (ID: $EXISTING_MAPPER) — skipping."
+else
+  MAPPER_CODE="$(curl -ksS \
+    -o "$TMP_DIR/mapper.out" \
+    -w '%{http_code}' \
+    -X POST \
+    "${KC_URL}/admin/realms/${REALM}/clients/${CLIENT_UUID}/protocol-mappers/models" \
+    -H "Authorization: Bearer ${ACCESS_TOKEN}" \
+    -H 'Content-Type: application/json' \
+    -d '{
+      "name": "groups",
+      "protocol": "openid-connect",
+      "protocolMapper": "oidc-group-membership-mapper",
+      "consentRequired": false,
+      "config": {
+        "full.path": "false",
+        "id.token.claim": "true",
+        "access.token.claim": "true",
+        "claim.name": "groups",
+        "userinfo.token.claim": "true"
+      }
+    }')"
+
+  if [[ "$MAPPER_CODE" == "201" ]]; then
+    success "oidc-group-membership-mapper created on '${CLIENT_ID}'."
+  else
+    cat "$TMP_DIR/mapper.out" >&2 || true
+    die "Failed to create oidc-group-membership-mapper (HTTP $MAPPER_CODE)."
+  fi
+fi
+
+###############################################################################
+# 7. Sync CONCERT_HUB_KEY so roja-pipeline can authenticate to ibm-roja-portal-gw
+#
+# roja-pipeline uses ROJA_AUTH=solis — it gets a JWT from ibm-solis-core using
+# CONCERT_HUB_KEY as the shared secret.  ibm-solis-core validates it against
+# SOLIS_HUB_INTERNAL_SECRET (concert-hub namespace).  If the two values differ,
+# every pipeline call to ibm-roja-portal-gw returns HTTP 403 — certificates,
+# SBOMs and infrastructure data appear to upload successfully (HTTP 202) but
+# never become visible in the Concert UI.
+###############################################################################
+
+log "Syncing CONCERT_HUB_KEY in concert namespace with SOLIS_HUB_INTERNAL_SECRET ..."
+HUB_INTERNAL_SECRET_B64=$(oc get secret app-cfg-secret -n "$HUB_NS" \
+    -o jsonpath='{.data.SOLIS_HUB_INTERNAL_SECRET}' 2>/dev/null || true)
+
+if [[ -z "${HUB_INTERNAL_SECRET_B64}" ]]; then
+  warn "Could not read SOLIS_HUB_INTERNAL_SECRET from concert-hub — skipping CONCERT_HUB_KEY sync."
+else
+  CURRENT_HUB_KEY_B64=$(oc get secret app-cfg-secret -n "$CONCERT_NS" \
+      -o jsonpath='{.data.CONCERT_HUB_KEY}' 2>/dev/null || true)
+
+  # Decode both and strip whitespace for comparison
+  HUB_INTERNAL_SECRET=$(echo "${HUB_INTERNAL_SECRET_B64}" | python3 -c \
+      "import sys,base64; print(base64.b64decode(sys.stdin.read().strip()).decode().strip())")
+  CURRENT_HUB_KEY=$(echo "${CURRENT_HUB_KEY_B64}" | python3 -c \
+      "import sys,base64; print(base64.b64decode(sys.stdin.read().strip()).decode().strip())" 2>/dev/null || echo "")
+
+  if [[ "${CURRENT_HUB_KEY}" == "${HUB_INTERNAL_SECRET}" ]]; then
+    success "CONCERT_HUB_KEY already matches SOLIS_HUB_INTERNAL_SECRET — no change needed."
+  else
+    NEW_B64=$(echo -n "${HUB_INTERNAL_SECRET}" | python3 -c \
+        "import sys,base64; print(base64.b64encode(sys.stdin.buffer.read()).decode())")
+    oc patch secret app-cfg-secret -n "$CONCERT_NS" --type merge \
+        -p "{\"data\":{\"CONCERT_HUB_KEY\":\"${NEW_B64}\"}}"
+    success "CONCERT_HUB_KEY patched to match SOLIS_HUB_INTERNAL_SECRET."
+  fi
+fi
+
+###############################################################################
+# 8. Restart required Hub and Concert deployments
 ###############################################################################
 
 log "Restarting Hub authentication components ..."
@@ -252,7 +351,7 @@ for d in ibm-solis-core ibm-solis-hub-gw ibm-solis-ui; do
 done
 
 log "Restarting Concert gateway/UI components ..."
-for d in concert-solis-gw roja-portal-gw roja-ui; do
+for d in concert-solis-gw roja-portal-gw roja-pipeline rojacore roja-ui; do
   if oc get deploy "$d" -n "$CONCERT_NS" >/dev/null 2>&1; then
     oc rollout restart deployment/"$d" -n "$CONCERT_NS" >/dev/null
   fi
@@ -264,7 +363,7 @@ for d in ibm-solis-core ibm-solis-hub-gw ibm-solis-ui; do
   fi
 done
 
-for d in concert-solis-gw roja-portal-gw roja-ui; do
+for d in concert-solis-gw roja-portal-gw roja-pipeline rojacore roja-ui; do
   if oc get deploy "$d" -n "$CONCERT_NS" >/dev/null 2>&1; then
     oc rollout status deployment/"$d" -n "$CONCERT_NS" --timeout=10m
   fi
@@ -273,7 +372,7 @@ done
 success "Required deployments are ready."
 
 ###############################################################################
-# 8. Optional bulk user provisioning
+# 9. Optional bulk user provisioning
 ###############################################################################
 
 create_or_update_users() {
@@ -371,14 +470,54 @@ create_or_update_users() {
       failed=$((failed + 1)); continue
     fi
 
-    success "Provisioned $username with role '$CONCERT_ROLE'."
+    # Ensure 'admin' Keycloak group exists and add user to it.
+    # ibm-solis-core maps group membership → platform JWT role via
+    # /mnt/infra/auth/roles ("Admin: admin"), so every Admin user must
+    # be in the Keycloak group named 'admin'.
+    curl -ksS -o /dev/null -X POST \
+      "${KC_URL}/admin/realms/${REALM}/groups" \
+      -H "Authorization: Bearer ${ACCESS_TOKEN}" \
+      -H 'Content-Type: application/json' \
+      -d '{"name":"admin"}' || true
+
+    ADMIN_GROUP_ID="$(curl -ksS -G \
+      "${KC_URL}/admin/realms/${REALM}/groups" \
+      -H "Authorization: Bearer ${ACCESS_TOKEN}" \
+      --data-urlencode "search=admin" \
+      | jq -r '.[] | select(.name=="admin") | .id // empty' | head -1)"
+
+    if [[ -n "$ADMIN_GROUP_ID" ]]; then
+      GROUP_CODE="$(curl -ksS -o /dev/null -w '%{http_code}' -X PUT \
+        "${KC_URL}/admin/realms/${REALM}/users/${USER_ID}/groups/${ADMIN_GROUP_ID}" \
+        -H "Authorization: Bearer ${ACCESS_TOKEN}" \
+        -H 'Content-Type: application/json' \
+        -d '{}')"
+      if [[ "$GROUP_CODE" == "204" ]]; then
+        log "Added '$username' to 'admin' group."
+      else
+        warn "Could not add '$username' to 'admin' group (HTTP $GROUP_CODE)."
+      fi
+    else
+      warn "Could not locate 'admin' group — group assignment skipped for '$username'."
+    fi
+
+    # Verify role was actually assigned
+    USER_ROLES="$(curl -ksS \
+      "${KC_URL}/admin/realms/${REALM}/users/${USER_ID}/role-mappings/clients/${CLIENT_UUID}" \
+      -H "Authorization: Bearer ${ACCESS_TOKEN}")"
+    if echo "$USER_ROLES" | jq -e --arg role "$CONCERT_ROLE" '.[] | select(.name == $role)' >/dev/null 2>&1; then
+      success "Provisioned $username with role '$CONCERT_ROLE'."
+    else
+      warn "Role '$CONCERT_ROLE' not confirmed on '$username' after assignment — check manually."
+      failed=$((failed + 1))
+    fi
   done < "$csv"
 
   log "User provisioning summary: total=$total created=$created updated=$updated failed=$failed"
   [[ "$failed" -eq 0 ]] || return 1
 }
 
-if [[ "${CREATE_USERS,,}" == "true" ]]; then
+if [[ "$(echo "${CREATE_USERS}" | tr '[:upper:]' '[:lower:]')" == "true" ]]; then
   create_or_update_users "$USERS_CSV"
 else
   log "CREATE_USERS=$CREATE_USERS; skipping user provisioning."

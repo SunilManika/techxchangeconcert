@@ -1,4 +1,4 @@
-i#!/usr/bin/env bash
+#!/usr/bin/env bash
 
 set -euo pipefail
 
@@ -160,18 +160,7 @@ oc get svc \
     >/dev/null 2>&1 || \
     die "Hub gateway service '${HUB_SERVICE}' not found."
 
-HUB_PORT=$(
-    oc get svc \
-      "${HUB_SERVICE}" \
-      -n "${NAMESPACE}" \
-      -o jsonpath='{.spec.ports[0].port}'
-)
-
-[[ -n "${HUB_PORT}" ]] || \
-    die "Unable to determine Hub gateway port."
-
 echo "Hub service : ${HUB_SERVICE}"
-echo "Hub port    : ${HUB_PORT}"
 
 ###############################################################################
 # Start temporary port-forward
@@ -185,17 +174,20 @@ rm -f /tmp/concert-kc-port-forward.log
 oc port-forward \
     -n "${NAMESPACE}" \
     "svc/${HUB_SERVICE}" \
-    "${LOCAL_PORT}:${HUB_PORT}" \
+    "${LOCAL_PORT}:11443" \
     >/tmp/concert-kc-port-forward.log 2>&1 &
 
 PORT_FORWARD_PID=$!
 
-sleep 3
-
-if ! kill -0 "${PORT_FORWARD_PID}" >/dev/null 2>&1; then
-    cat /tmp/concert-kc-port-forward.log
-    die "Port-forward failed."
-fi
+_deadline=$(( $(date +%s) + 15 ))
+until nc -z 127.0.0.1 "${LOCAL_PORT}" 2>/dev/null; do
+    if ! kill -0 "${PORT_FORWARD_PID}" 2>/dev/null; then
+        cat /tmp/concert-kc-port-forward.log
+        die "Port-forward process died."
+    fi
+    [[ $(date +%s) -lt "${_deadline}" ]] || { cat /tmp/concert-kc-port-forward.log; die "Port-forward not ready after 15s."; }
+    sleep 0.5
+done
 
 KEYCLOAK_URL="https://127.0.0.1:${LOCAL_PORT}/sys/internal/kc"
 
@@ -611,6 +603,54 @@ do
 
         FAILED=$((FAILED + 1))
         continue
+    fi
+
+    ###########################################################################
+    # Ensure 'admin' Keycloak group exists and add user to it
+    #
+    # ibm-solis-core maps group membership → platform JWT role via the file
+    # /mnt/infra/auth/roles which contains:
+    #   Admin: admin
+    # So every Concert Admin user must be in the Keycloak group named 'admin'.
+    ###########################################################################
+
+    echo "Ensuring 'admin' group exists and adding user..."
+
+    # Create the group if it doesn't exist (409 = already exists, both are fine)
+    curl -k -sS -o /dev/null \
+        -X POST \
+        "${KEYCLOAK_URL}/admin/realms/${REALM}/groups" \
+        -H "Authorization: Bearer ${ACCESS_TOKEN}" \
+        -H "Content-Type: application/json" \
+        -d '{"name":"admin"}' || true
+
+    # Get the group ID
+    ADMIN_GROUP_ID=$(
+        curl -k -sS \
+            -G "${KEYCLOAK_URL}/admin/realms/${REALM}/groups" \
+            -H "Authorization: Bearer ${ACCESS_TOKEN}" \
+            --data-urlencode "search=admin" \
+            | jq -r '.[] | select(.name=="admin") | .id // empty' | head -1
+    )
+
+    if [[ -z "${ADMIN_GROUP_ID}" ]]; then
+        echo "WARN: Could not find 'admin' group — skipping group assignment for ${username}"
+    else
+        GROUP_CODE=$(
+            curl -k -sS \
+                -o /dev/null \
+                -w '%{http_code}' \
+                -X PUT \
+                "${KEYCLOAK_URL}/admin/realms/${REALM}/users/${USER_ID}/groups/${ADMIN_GROUP_ID}" \
+                -H "Authorization: Bearer ${ACCESS_TOKEN}" \
+                -H "Content-Type: application/json" \
+                -d '{}'
+        )
+        if [[ "${GROUP_CODE}" == "204" ]]; then
+            echo "Added ${username} to 'admin' group."
+        else
+            echo "WARN: Could not add ${username} to 'admin' group (HTTP ${GROUP_CODE})."
+        fi
     fi
 
     ###########################################################################
